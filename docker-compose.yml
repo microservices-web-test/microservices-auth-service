@@ -1,0 +1,61 @@
+# This service is an independent repo. It joins the shared, pre-created
+# "microservices-net" network so the frontend (in a different repo/compose
+# project) can reach it by container name.
+#
+# One-time, before the first `up`:
+#   docker network create microservices-net
+#
+# Then from this folder:
+#   docker-compose up -d --build
+
+services:
+  auth-service:
+    build: .
+    image: auth-service:local
+    container_name: auth-service
+    environment:
+      PORT: "3000"
+      DB_HOST: auth-db
+      DB_PORT: "5432"
+      DB_USER: auth
+      DB_PASSWORD: authpass
+      DB_NAME: authdb
+    ports:
+      # Optional: exposed on the host only so you can curl it directly while
+      # debugging. The frontend does NOT use this; it talks over the network.
+      - "3000:3000"
+    depends_on:
+      auth-db:
+        condition: service_healthy
+    networks:
+      - microservices-net
+    restart: unless-stopped
+
+  auth-db:
+    image: postgres:16-alpine
+    container_name: auth-db
+    environment:
+      POSTGRES_USER: auth
+      POSTGRES_PASSWORD: authpass
+      POSTGRES_DB: authdb
+    volumes:
+      - auth-db-data:/var/lib/postgresql/data
+      # Seed schema + data on first start.
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U auth -d authdb"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - microservices-net
+    restart: unless-stopped
+
+volumes:
+  auth-db-data:
+
+# Shared network is created OUTSIDE this compose file (external: true) so
+# multiple independent service repos can all attach to the same network.
+networks:
+  microservices-net:
+    external: true
