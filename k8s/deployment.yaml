@@ -76,7 +76,7 @@ spec:
               memory: "192Mi"
           securityContext:
             runAsNonRoot: true
-            runAsUser: 1000          # the "node" user in node:20-alpine
+            runAsUser: 1000
             allowPrivilegeEscalation: false
             capabilities:
               drop: ["ALL"]

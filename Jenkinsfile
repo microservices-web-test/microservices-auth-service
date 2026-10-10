@@ -7,14 +7,7 @@ pipeline {
     buildDiscarder(logRotator(numToKeepStr: '20'))
   }
   triggers {
-    // Auto-build when GitHub sends a push webhook to Jenkins.
-    // One-time setup in the repo: Settings -> Webhooks -> Add webhook
-    //   Payload URL : http://141.147.71.111:8080/github-webhook/
-    //   Content type: application/json
-    //   Events      : Just the push event
     githubPush()
-    // Fallback if you ever can't use a webhook (Jenkins polls every 5 min):
-    // pollSCM('H/5 * * * *')
   }
   environment {
     OCIR_REGISTRY  = 'lhr.ocir.io'
@@ -77,12 +70,7 @@ pipeline {
         }
       }
     }
-    // ---------------------------------------------------------------------
-    // The in-cluster work is split into three visible stages so the Jenkins
-    // stage view tells a clear story: bring the DB up -> migrate it -> deploy
-    // the app. Each stage needs the kubeconfig (Postgres, Flyway and the app
-    // all live inside k3s).
-    // ---------------------------------------------------------------------
+
     stage('Provision Postgres (k3s)') {
       steps {
         withCredentials([file(credentialsId: 'kubeconfig', variable: 'KUBECONFIG_FILE')]) {

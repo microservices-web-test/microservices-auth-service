@@ -1,5 +1,3 @@
-# Dedicated PostgreSQL for the auth service (database-per-service pattern).
-# A PVC gives the data a stable home so it survives pod restarts.
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -13,7 +11,6 @@ spec:
   resources:
     requests:
       storage: 1Gi
-  # storageClassName omitted -> uses k3s default (local-path).
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -26,7 +23,7 @@ metadata:
 spec:
   replicas: 1
   strategy:
-    type: Recreate          # a single DB pod owns the volume; never two at once
+    type: Recreate
   selector:
     matchLabels:
       app: auth-db
@@ -46,7 +43,6 @@ spec:
             - secretRef:
                 name: auth-db-credentials
           env:
-            # Keep PGDATA in a sub-dir so the mounted volume root stays clean.
             - name: PGDATA
               value: /var/lib/postgresql/data/pgdata
           volumeMounts:
