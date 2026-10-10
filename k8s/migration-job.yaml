@@ -1,0 +1,51 @@
+# One-shot Flyway Job: applies the SQL migrations in db/migrations to auth-db,
+# records them in flyway_schema_history (so each runs exactly once), then exits.
+# The SQL is supplied by the "auth-migrations" ConfigMap, which the Jenkins
+# pipeline (re)creates from the repo's db/migrations folder on every deploy.
+# Flyway is idempotent, so re-running on each deploy is safe.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: auth-migrate
+  namespace: microservices
+  labels:
+    app: auth-migrate
+    app.kubernetes.io/part-of: microservices-demo
+spec:
+  backoffLimit: 6
+  ttlSecondsAfterFinished: 600   # auto-clean the finished Job after 10 min
+  template:
+    metadata:
+      labels:
+        app: auth-migrate
+        app.kubernetes.io/part-of: microservices-demo
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: flyway
+          image: flyway/flyway:10-alpine
+          args:
+            - "-connectRetries=30"
+            - "-baselineOnMigrate=true"
+            - "migrate"
+          env:
+            - name: FLYWAY_URL
+              value: jdbc:postgresql://auth-db:5432/authdb
+            - name: FLYWAY_USER
+              valueFrom:
+                secretKeyRef:
+                  name: auth-db-credentials
+                  key: POSTGRES_USER
+            - name: FLYWAY_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: auth-db-credentials
+                  key: POSTGRES_PASSWORD
+          volumeMounts:
+            - name: sql
+              mountPath: /flyway/sql
+              readOnly: true
+      volumes:
+        - name: sql
+          configMap:
+            name: auth-migrations
