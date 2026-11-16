@@ -1,3 +1,6 @@
+// CI only: test -> build -> push to OCIR -> bump image tag in the GitOps config repo.
+// Deployment is done by Argo CD, which watches microservices-app-config (apps/auth-service).
+// Jenkins holds NO cluster credentials (no kubeconfig).
 pipeline {
   agent any
   options {
@@ -14,11 +17,11 @@ pipeline {
     OCI_TENANCY_NS = 'lryjhgnewmyj'
     IMAGE_REPO     = 'microservices-auth'
     IMAGE_NAME     = "${OCIR_REGISTRY}/${OCI_TENANCY_NS}/${IMAGE_REPO}"
-    // ---- k3s target ----
-    K8S_NAMESPACE  = 'microservices'
-    K8S_DEPLOYMENT = 'auth-service'
-    K8S_CONTAINER  = 'auth-service'
-    PULL_SECRET    = 'ocir-secret'
+
+    // ---- GitOps config repo ----
+    CONFIG_REPO    = 'git@github.com:microservices-web-test/microservices-app-config.git'
+    CONFIG_BRANCH  = 'main'
+    CONFIG_DIR     = 'apps/auth-service'
   }
   stages {
     stage('Checkout') {
@@ -29,6 +32,16 @@ pipeline {
           env.IMAGE_TAG = "${env.BUILD_NUMBER}-${env.GIT_SHA}"
           echo "Building ${IMAGE_NAME}:${env.IMAGE_TAG}"
         }
+      }
+    }
+    stage('Test') {
+      steps {
+        sh '''
+          set -eu
+          docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp \
+            -v "$PWD":/app -w /app node:20-alpine \
+            sh -c "npm ci && npm test"
+        '''
       }
     }
     stage('Build image (arm64)') {
@@ -70,102 +83,47 @@ pipeline {
         }
       }
     }
-
-    stage('Provision Postgres (k3s)') {
+    stage('Update GitOps config repo') {
       steps {
-        withCredentials([file(credentialsId: 'kubeconfig', variable: 'KUBECONFIG_FILE')]) {
+        // SSH key with WRITE access to microservices-app-config only.
+        withCredentials([sshUserPrivateKey(
+          credentialsId: 'config-repo-ssh',
+          keyFileVariable: 'CONFIG_SSH_KEY')]) {
           sh '''
             set -eu
-            export KUBECONFIG="${KUBECONFIG_FILE}"
-            # Namespace (shared with the frontend; harmless if it already exists).
-            kubectl apply -f k8s/namespace.yaml
-            # DB credentials + the dedicated Postgres (PVC / Deployment / Service).
-            kubectl apply -f k8s/secret.yaml
-            kubectl apply -f k8s/postgres.yaml
-            # Block until the database is actually accepting connections.
-            echo ">> waiting for auth-db to become Ready..."
-            kubectl -n "${K8S_NAMESPACE}" rollout status deployment/auth-db --timeout=180s
-          '''
-        }
-      }
-    }
-    stage('DB migration (Flyway)') {
-      steps {
-        withCredentials([file(credentialsId: 'kubeconfig', variable: 'KUBECONFIG_FILE')]) {
-          sh '''
-            set -eu
-            export KUBECONFIG="${KUBECONFIG_FILE}"
+            export GIT_SSH_COMMAND="ssh -i ${CONFIG_SSH_KEY} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+            APP_DIR="$PWD"
+            rm -rf .config-repo
+            git clone --depth 1 --branch "${CONFIG_BRANCH}" "${CONFIG_REPO}" .config-repo
+            cd .config-repo
+            git config user.name  "jenkins-ci"
+            git config user.email "jenkins-ci@users.noreply.github.com"
 
-            # Ship the repo's SQL to the cluster as a ConfigMap (the Flyway Job
-            # mounts it at /flyway/sql).
-            kubectl -n "${K8S_NAMESPACE}" create configmap auth-migrations \
-              --from-file=db/migrations/ \
-              --dry-run=client -o yaml | kubectl apply -f -
+            K="${CONFIG_DIR}/kustomization.yaml"
 
-            # A Job's pod template is immutable, so delete any previous run first,
-            # then (re)create it. Flyway is idempotent -> safe to run every build.
-            kubectl -n "${K8S_NAMESPACE}" delete job auth-migrate --ignore-not-found
-            kubectl apply -f k8s/migration-job.yaml
+            # 1) point the manifests at the new immutable image tag
+            sed -i -E "s/^([[:space:]]*newTag:).*/\\1 ${IMAGE_TAG}/" "$K"
 
-            # Stream the Flyway container's output straight into this console so
-            # you can watch it: connect -> check schema history -> apply pending
-            # migrations -> exit. First wait for the Job's pod to appear.
-            echo ">> waiting for the auth-migrate pod to start..."
-            POD=""
-            for i in $(seq 1 60); do
-              POD=$(kubectl -n "${K8S_NAMESPACE}" get pods -l job-name=auth-migrate \
-                      -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
-              [ -n "$POD" ] && break
-              sleep 2
+            # 2) sync Flyway migrations (app code owns them) into the config repo
+            rm -f "${CONFIG_DIR}"/migrations/*.sql
+            cp "${APP_DIR}"/db/migrations/*.sql "${CONFIG_DIR}/migrations/"
+            LIST=$(for f in "${CONFIG_DIR}"/migrations/*.sql; do echo "      - migrations/$(basename "$f")"; done)
+            awk -v list="$LIST" '
+              /# BEGIN migrations/ {print; print list; skip=1; next}
+              /# END migrations/   {skip=0}
+              !skip {print}' "$K" > "$K.tmp" && mv "$K.tmp" "$K"
+
+            git add -A "${CONFIG_DIR}"
+            if git diff --cached --quiet; then
+              echo "No config changes to commit."
+              exit 0
+            fi
+            git commit -m "auth-service: deploy ${IMAGE_TAG} [skip ci]"
+            # retry if another service's pipeline pushed meanwhile
+            for i in 1 2 3; do
+              git push origin "HEAD:${CONFIG_BRANCH}" && break
+              git pull --rebase origin "${CONFIG_BRANCH}"
             done
-            echo ">> streaming Flyway logs from pod: ${POD}"
-            kubectl -n "${K8S_NAMESPACE}" logs -f "job/auth-migrate" || true
-
-            # Assert the Job actually succeeded; dump diagnostics and fail if not.
-            if ! kubectl -n "${K8S_NAMESPACE}" wait --for=condition=complete \
-                 job/auth-migrate --timeout=180s; then
-              echo "!! Flyway migration did NOT complete successfully:"
-              kubectl -n "${K8S_NAMESPACE}" logs "job/auth-migrate" --tail=-1 || true
-              kubectl -n "${K8S_NAMESPACE}" describe job auth-migrate || true
-              exit 1
-            fi
-            echo ">> migrations applied successfully."
-          '''
-        }
-      }
-    }
-    stage('Deploy app (k3s)') {
-      steps {
-        withCredentials([
-          file(credentialsId: 'kubeconfig', variable: 'KUBECONFIG_FILE'),
-          usernamePassword(credentialsId: 'ocir-credentials',
-                           usernameVariable: 'OCIR_USER',
-                           passwordVariable: 'OCIR_TOKEN')]) {
-          sh '''
-            set -eu
-            export KUBECONFIG="${KUBECONFIG_FILE}"
-            # Private-registry pull secret (idempotent create-or-update) — the
-            # app image is private, so the cluster needs credentials to pull it.
-            kubectl -n "${K8S_NAMESPACE}" create secret docker-registry "${PULL_SECRET}" \
-              --docker-server="${OCIR_REGISTRY}" \
-              --docker-username="${OCIR_USER}" \
-              --docker-password="${OCIR_TOKEN}" \
-              --dry-run=client -o yaml | kubectl apply -f -
-            # Internal Service (ClusterIP auth-service:3000).
-            kubectl apply -f k8s/service.yaml
-            # App Deployment with the freshly built, immutable tag substituted in.
-            sed "s#${IMAGE_NAME}:v1#${IMAGE_NAME}:${IMAGE_TAG}#g" k8s/deployment.yaml \
-              | kubectl apply -f -
-            kubectl -n "${K8S_NAMESPACE}" set image \
-              "deployment/${K8S_DEPLOYMENT}" \
-              "${K8S_CONTAINER}=${IMAGE_NAME}:${IMAGE_TAG}"
-            # Wait for rollout; auto-rollback on failure.
-            if ! kubectl -n "${K8S_NAMESPACE}" rollout status \
-                 "deployment/${K8S_DEPLOYMENT}" --timeout=180s; then
-              echo "Rollout failed; rolling back."
-              kubectl -n "${K8S_NAMESPACE}" rollout undo "deployment/${K8S_DEPLOYMENT}"
-              exit 1
-            fi
           '''
         }
       }
@@ -173,10 +131,11 @@ pipeline {
   }
   post {
     success {
-      echo "Deployed ${IMAGE_NAME}:${IMAGE_TAG} to k3s namespace ${K8S_NAMESPACE} (ClusterIP auth-service:3000)."
+      echo "Pushed ${IMAGE_NAME}:${IMAGE_TAG} and updated the config repo. Argo CD will deploy it."
     }
     always {
-      sh 'docker image rm "${IMAGE_NAME}:${IMAGE_TAG}" "${IMAGE_NAME}:latest" >/dev/null 2>&1 || true'
+      sh 'rm -rf .config-repo; docker image rm "${IMAGE_NAME}:${IMAGE_TAG}" "${IMAGE_NAME}:latest" >/dev/null 2>&1 || true'
     }
   }
 }
+
