@@ -132,7 +132,7 @@ pipeline {
   }
   post {
     success {
-      echo "Pushed ${IMAGE_NAME}:${IMAGE_TAG} and updated the config repo. Argo CD will deploy it."
+      echo "Pushed ${IMAGE_NAME}:${IMAGE_TAG} and updated the config repo. Argo CD will deploy it with its cd pipeline."
     }
     always {
       sh 'rm -rf .config-repo; docker image rm "${IMAGE_NAME}:${IMAGE_TAG}" "${IMAGE_NAME}:latest" >/dev/null 2>&1 || true'
