@@ -1,4 +1,4 @@
-// CI only: test -> build -> push to OCIR -> bump image tag in the GitOps config repo.
+// CI only: test -> build -> push to Docker Hub -> bump image tag in the GitOps config repo.
 // Deployment is done by Argo CD, which watches microservices-app-config (apps/auth-service).
 // Jenkins holds NO cluster credentials (no kubeconfig).
 pipeline {
@@ -13,10 +13,10 @@ pipeline {
     githubPush()
   }
   environment {
-    OCIR_REGISTRY  = 'lhr.ocir.io'
-    OCI_TENANCY_NS = 'lryjhgnewmyj'
-    IMAGE_REPO     = 'microservices-auth'
-    IMAGE_NAME     = "${OCIR_REGISTRY}/${OCI_TENANCY_NS}/${IMAGE_REPO}"
+    // Docker Hub: <namespace>/<repo>  (public repo, no pull secret needed)
+    DOCKERHUB_NS   = 'nandul2424'
+    IMAGE_REPO     = 'microservices-auth-service'
+    IMAGE_NAME     = "${DOCKERHUB_NS}/${IMAGE_REPO}"
 
     // ---- GitOps config repo ----
     CONFIG_REPO    = 'git@github.com:microservices-web-test/microservices-app-config.git'
@@ -67,18 +67,19 @@ pipeline {
         '''
       }
     }
-    stage('Push to OCIR') {
+    stage('Push to Docker Hub') {
       steps {
+        // Docker Hub username + access token (Read & Write) stored in Jenkins.
         withCredentials([usernamePassword(
-          credentialsId: 'ocir-credentials',
-          usernameVariable: 'OCIR_USER',
-          passwordVariable: 'OCIR_TOKEN')]) {
+          credentialsId: 'dockerhub-credentials',
+          usernameVariable: 'DH_USER',
+          passwordVariable: 'DH_TOKEN')]) {
           sh '''
             set -eu
-            echo "${OCIR_TOKEN}" | docker login "${OCIR_REGISTRY}" -u "${OCIR_USER}" --password-stdin
+            echo "${DH_TOKEN}" | docker login -u "${DH_USER}" --password-stdin
             docker push "${IMAGE_NAME}:${IMAGE_TAG}"
             docker push "${IMAGE_NAME}:latest"
-            docker logout "${OCIR_REGISTRY}" || true
+            docker logout || true
           '''
         }
       }
